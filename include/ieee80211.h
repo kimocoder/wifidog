@@ -1,3 +1,6 @@
+#ifndef __IEEE80211_H__
+#define __IEEE80211_H__
+
 #define MYREPLAYCOUNT 63232
 
 #define	MAC_SIZE_ACK		(10)
@@ -803,4 +806,9 @@ static const int myvendorsta[] =
 0xd85dfb, 0xdc7014, 0xe00db9, 0xe0cb1d, 0xe80410, 0xf04f7c, 0xf0a225, 0xfcc233
 };
 #define MYVENDORSTA_SIZE sizeof(myvendorsta)
+
+//NeoJou
+int getkeyinfo(uint16_t ki);
 /*===========================================================================*/
+
+#endif //__IEEE80211_H__

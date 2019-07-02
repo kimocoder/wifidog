@@ -36,6 +36,11 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netpacket/packet.h>
+#include <linux/nl80211.h>
+
+#include "netlink/netlink.h"
+#include "netlink/genl/genl.h"
+#include "netlink/genl/ctrl.h"
 
 #include "include/version.h"
 #include "include/wifidog.h"
@@ -44,6 +49,7 @@
 #include "include/pcap.h"
 #include "include/ieee80211.h"
 #include "include/hashops.h"
+#include "include/strings.h"
 
 /*===========================================================================*/
 /* global var */
@@ -162,6 +168,8 @@ static char *filterlistname;
 static char *filterssid;
 static char *rcascanlistname;
 static char *rcascanpcapngname;
+
+static int filterchannel;
 
 static const uint8_t hdradiotap[] = {
 	0x00, 0x00,		// radiotap version + pad byte
@@ -436,7 +444,7 @@ static void globalclose()
 }
 
 /*===========================================================================*/
-static inline void printapinfo()
+static inline void printapinfo(uint8_t ch)
 {
 	static int c, p;
 	static int rangecount;
@@ -487,7 +495,7 @@ static inline void printapinfo()
 	fprintf(stdout,
 		"INFO: cha=%d, rx=%llu, rx(dropped)=%llu, tx=%llu, err=%d, aps=%d (%d in range)\n"
 		"-----------------------------------------------------------------------------------\n",
-		channelscanlist[cpa], incommingcount, droppedcount,
+		ch, incommingcount, droppedcount,
 		outgoingcount, errorcount, aplistcount, rangecount);
 	return;
 }
@@ -1416,7 +1424,6 @@ static inline bool process80211eap()
 
 	static exteap_t *exteap;
 	static uint16_t exteaplen;
-	bool bfound = false;
 
 	eapauthptr = payload_ptr + LLC_SIZE;
 	eapauthlen = payload_len - LLC_SIZE;
@@ -1496,7 +1503,6 @@ static inline bool process80211eap()
 						fprintf(stdout,
 							" [FOUND AUTHORIZED HANDSHAKE, EAPOL TIMEOUT %d]\n",
 							calceapoltimeout);
-						bfound = true;
 					}
 				}
 			}
@@ -1504,7 +1510,6 @@ static inline bool process80211eap()
 			memset(&lastapm2, 0, 6);
 			lastrcm2 = 0;
 			lasttimestampm2 = 0;
-			//return bfound;
 			return false;
 		}
 		if (keyinfo == 2) {
@@ -2966,7 +2971,7 @@ static inline void programmende(int signum)
 }
 
 /*===========================================================================*/
-static bool set_channel()
+static bool set_channel(uint8_t ch)
 {
 	static int res;
 	static struct iwreq pwrq;
@@ -2976,7 +2981,7 @@ static bool set_channel()
 	strncpy(pwrq.ifr_name, interfacename, IFNAMSIZ - 1);
 	pwrq.u.freq.e = 0;
 	pwrq.u.freq.flags = IW_FREQ_FIXED;
-	pwrq.u.freq.m = channelscanlist[cpa];
+	pwrq.u.freq.m = ch;
 	res = ioctl(fd_socket, SIOCSIWFREQ, &pwrq);
 	if (res < 0) {
 		return false;
@@ -2985,24 +2990,10 @@ static bool set_channel()
 }
 
 /*===========================================================================*/
-static void remove_channel_from_scanlist(uint8_t c)
+static void test_channels(uint8_t ch)
 {
-	while (channelscanlist[c + 1] != 0) {
-		channelscanlist[c] = channelscanlist[c + 1];
-		c++;
-	}
-	channelscanlist[c] = channelscanlist[c + 1];
-	return;
-}
-
-/*===========================================================================*/
-static void test_channels()
-{
-	static uint8_t c;
-	static int res;
-	static struct iwreq pwrq;
-	static int frequency;
-	static int testchannel;
+	int res;
+	struct iwreq pwrq;
 
 	usleep(10000);
 	memset(&pwrq, 0, sizeof(pwrq));
@@ -3012,157 +3003,31 @@ static void test_channels()
 	pwrq.u.freq.m = 2;
 	res = ioctl(fd_socket, SIOCSIWFREQ, &pwrq);
 
-	c = 0;
-	while (channelscanlist[c] != 0) {
-		testchannel = 0;
-		frequency = 0;
-		usleep(10000);
-		memset(&pwrq, 0, sizeof(pwrq));
-		strncpy(pwrq.ifr_name, interfacename, IFNAMSIZ - 1);
-		pwrq.u.freq.e = 0;
-		pwrq.u.freq.flags = IW_FREQ_FIXED;
-		pwrq.u.freq.m = channelscanlist[c];
-		res = ioctl(fd_socket, SIOCSIWFREQ, &pwrq);
-		if (res < 0) {
-			printf
-			    ("warning: failed to set channel %d (%s) - removed this channel from scan list\n",
-			     channelscanlist[c], strerror(errno));
-			remove_channel_from_scanlist(c);
-			continue;
-		}
-		usleep(10000);
-		memset(&pwrq, 0, sizeof(pwrq));
-		strncpy(pwrq.ifr_name, interfacename, IFNAMSIZ - 1);
-		pwrq.u.freq.e = 0;
-		pwrq.u.freq.flags = IW_FREQ_FIXED;
-		res = ioctl(fd_socket, SIOCGIWFREQ, &pwrq);
-		if (res < 0) {
-			printf
-			    ("warning: failed to set channel %d (%s) - removed this channel from scan list\n",
-			     channelscanlist[c], strerror(errno));
-			remove_channel_from_scanlist(c);
-			continue;
-		}
-		frequency = pwrq.u.freq.m;
-		if (frequency > 100000) {
-			frequency /= 100000;
-		}
-		if (frequency < 1000) {
-			testchannel = frequency;
-		} else if ((frequency >= 2407) && (frequency <= 2474)) {
-			testchannel = (frequency - 2407) / 5;
-		} else if ((frequency >= 2481) && (frequency <= 2487)) {
-			testchannel = (frequency - 2412) / 5;
-		} else if ((frequency >= 5150) && (frequency <= 5875)) {
-			testchannel = (frequency - 5000) / 5;
-		}
-		if (testchannel != channelscanlist[c]) {
-			if (testchannel == frequency) {
-				printf
-				    ("warning: failed to set channel %d - removed this channel from scan list\n",
-				     channelscanlist[c]);
-			} else {
-				printf
-				    ("warning: failed to set channel %d (%dMHz) - removed this channel from scan list\n",
-				     channelscanlist[c], frequency);
-			}
-			remove_channel_from_scanlist(c);
-			continue;
-		}
-		c++;
+	usleep(10000);
+	memset(&pwrq, 0, sizeof(pwrq));
+	strncpy(pwrq.ifr_name, interfacename, IFNAMSIZ - 1);
+	pwrq.u.freq.e = 0;
+	pwrq.u.freq.flags = IW_FREQ_FIXED;
+	pwrq.u.freq.m = ch;
+	res = ioctl(fd_socket, SIOCSIWFREQ, &pwrq);
+	if (res < 0) {
+		printf("warning: failed to set channel %d (%s) - removed this channel from scan list\n",
+		       ch, strerror(errno));
+		return;
 	}
-	return;
-}
 
-/*===========================================================================*/
-static void show_channels()
-{
-	static int c;
-	static int res;
-	static struct iwreq pwrq;
-	static int frequency;
-	static int testchannel;
-
-	fprintf(stdout, "available channels:\n");
-	for (c = 0; c < 256; c++) {
-		testchannel = 0;
-		frequency = 0;
-		memset(&pwrq, 0, sizeof(pwrq));
-		strncpy(pwrq.ifr_name, interfacename, IFNAMSIZ - 1);
-		pwrq.u.freq.e = 0;
-		pwrq.u.freq.flags = IW_FREQ_FIXED;
-		pwrq.u.freq.m = c;
-		res = ioctl(fd_socket, SIOCSIWFREQ, &pwrq);
-		if (res >= 0) {
-			memset(&pwrq, 0, sizeof(pwrq));
-			strncpy(pwrq.ifr_name, interfacename, IFNAMSIZ - 1);
-			pwrq.u.freq.e = 0;
-			pwrq.u.freq.flags = IW_FREQ_FIXED;
-			res = ioctl(fd_socket, SIOCGIWFREQ, &pwrq);
-			if (res >= 0) {
-				frequency = pwrq.u.freq.m;
-				if (frequency > 100000) {
-					frequency /= 100000;
-				}
-				if (frequency < 1000) {
-					testchannel = frequency;
-				} else if ((frequency >= 2407)
-					   && (frequency <= 2474)) {
-					testchannel = (frequency - 2407) / 5;
-				} else if ((frequency >= 2481)
-					   && (frequency <= 2487)) {
-					testchannel = (frequency - 2412) / 5;
-				} else if ((frequency >= 5150)
-					   && (frequency <= 5875)) {
-					testchannel = (frequency - 5000) / 5;
-				}
-				if (testchannel > 0) {
-					memset(&pwrq, 0, sizeof(pwrq));
-					strncpy(pwrq.ifr_name, interfacename,
-						IFNAMSIZ - 1);
-					pwrq.u.txpower.value = -1;
-					pwrq.u.txpower.fixed = 1;
-					pwrq.u.txpower.disabled = 0;
-					pwrq.u.txpower.flags = IW_TXPOW_DBM;
-					if (ioctl
-					    (fd_socket, SIOCGIWTXPOW,
-					     &pwrq) < 0) {
-						if (testchannel == frequency) {
-							fprintf(stdout,
-								" %3d\n",
-								testchannel);
-						} else {
-							fprintf(stdout,
-								" %3d / %4dMHz\n",
-								testchannel,
-								frequency);
-						}
-					} else {
-						if (pwrq.u.txpower.value > 0) {
-							if (testchannel ==
-							    frequency) {
-								fprintf(stdout,
-									"%3d (%2d dBm)\n",
-									testchannel,
-									pwrq.u.
-									txpower.
-									value);
-							} else {
-								fprintf(stdout,
-									"%3d / %4dMHz (%2d dBm)\n",
-									testchannel,
-									frequency,
-									pwrq.u.
-									txpower.
-									value);
-							}
-						}
-					}
-
-				}
-			}
-		}
+	usleep(10000);
+	memset(&pwrq, 0, sizeof(pwrq));
+	strncpy(pwrq.ifr_name, interfacename, IFNAMSIZ - 1);
+	pwrq.u.freq.e = 0;
+	pwrq.u.freq.flags = IW_FREQ_FIXED;
+	res = ioctl(fd_socket, SIOCGIWFREQ, &pwrq);
+	if (res < 0) {
+		printf("warning: failed to set channel %d (%s) - removed this channel from scan list\n",
+		       ch, strerror(errno));
+		return;
 	}
+	
 	return;
 }
 
@@ -3327,7 +3192,7 @@ static inline bool activate_gpsd()
 }
 
 /*===========================================================================*/
-static inline void processpackets()
+static inline void processpackets(uint8_t ch)
 {
 	static int c;
 	static int sa;
@@ -3481,7 +3346,7 @@ static inline void processpackets()
 	oldincommingcount1 = 0;
 	oldincommingcount5 = 0;
 
-	if (set_channel() == false) {
+	if (set_channel(ch) == false) {
 		fprintf(stderr, "failed to set channel\n");
 		globalclose();
 	}
@@ -3567,7 +3432,7 @@ static inline void processpackets()
 				if (gpsdflag == false) {
 					printf
 					    ("\33[2K\rINFO: cha=%d, rx=%llu, rx(dropped)=%llu, tx=%llu, powned=%llu, err=%d",
-					     channelscanlist[cpa],
+					     ch,
 					     incommingcount, droppedcount,
 					     outgoingcount, pownedcount,
 					     errorcount);
@@ -3614,7 +3479,7 @@ static inline void processpackets()
 				if (channelscanlist[cpa] == 0) {
 					cpa = 0;
 				}
-				if (set_channel() == true) {
+				if (set_channel(ch) == true) {
 					if (activescanflag == false) {
 						send_broadcastbeacon();
 						send_undirected_proberequest();
@@ -3980,7 +3845,7 @@ static inline void processpackets()
 }
 
 /*===========================================================================*/
-static inline void processrcascan()
+static inline void processrcascan(uint8_t ch)
 {
 	static int fdnum;
 	static long long int statuscount;
@@ -3994,7 +3859,7 @@ static inline void processrcascan()
 	tvfd.tv_sec = 1;
 	tvfd.tv_usec = 0;
 	statuscount = 1;
-	if (set_channel() == false) {
+	if (set_channel(ch) == false) {
 		fprintf(stderr, "\nfailed to set channel\n");
 		globalclose();
 	}
@@ -4053,12 +3918,12 @@ static inline void processrcascan()
 				}
 			}
 			if ((statuscount % 2) == 0) {
-				printapinfo();
+				printapinfo(ch);
 				cpa++;
 				if (channelscanlist[cpa] == 0) {
 					cpa = 0;
 				}
-				if (set_channel() == true) {
+				if (set_channel(ch) == true) {
 					send_undirected_proberequest();
 				} else {
 					printf("\nfailed to set channel\n");
@@ -4806,47 +4671,6 @@ static bool get_perm_addr(char *ifname, uint8_t * permaddr, char *drivername)
 }
 
 /*===========================================================================*/
-static void show_wlaninterfaces()
-{
-	static int p;
-	static struct ifaddrs *ifaddr = NULL;
-	static struct ifaddrs *ifa = NULL;
-	static uint8_t permaddr[6];
-	static char drivername[32];
-
-	if (getifaddrs(&ifaddr) == -1) {
-		perror("failed to get ifaddrs");
-	} else {
-		printf("wlan interfaces:\n");
-		for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-			if ((ifa->ifa_addr)
-			    && (ifa->ifa_addr->sa_family == AF_PACKET)) {
-				memset(&drivername, 0, 32);
-				if (get_perm_addr
-				    (ifa->ifa_name, permaddr,
-				     drivername) == true) {
-					for (p = 0; p < 6; p++) {
-						printf("%02x", (permaddr[p]));
-					}
-					if (checkmonitorinterface(ifa->ifa_name)
-					    == false) {
-						printf(" %s (%s)\n",
-						       ifa->ifa_name,
-						       drivername);
-					} else {
-						printf
-						    (" %s (%s)  warning: probably a monitor interface!\n",
-						     ifa->ifa_name, drivername);
-					}
-				}
-			}
-		}
-		freeifaddrs(ifaddr);
-	}
-	return;
-}
-
-/*===========================================================================*/
 __attribute__ ((noreturn))
 static inline void version(char *eigenname)
 {
@@ -4893,13 +4717,243 @@ static inline void usageerror(char *eigenname)
 }
 
 /*===========================================================================*/
+struct trigger_results
+{
+	int done;
+	int aborted;
+};
+
+static int error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg)
+{
+	int *ret = arg;
+
+	printf("error_handler() called.\n");
+	*ret = err->error;
+	return NL_STOP;
+}
+
+static int finish_handler(struct nl_msg *msg, void *arg)
+{
+	int *ret = arg;
+	*ret = 0;
+	return NL_SKIP;
+}
+
+static int ack_handler(struct nl_msg *msg, void *arg)
+{
+	int *ret = arg;
+	
+	*ret = 0;
+	return NL_STOP;
+}
+
+static int no_seq_check(struct nl_msg *msg, void *arg)
+{
+	return NL_OK;
+}
+
+static int callback_trigger(struct nl_msg *msg, void *arg)
+{
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct trigger_results *results = arg;
+
+	if (gnlh->cmd == NL80211_CMD_SCAN_ABORTED) {
+		printf("Got NL80211_CMD_SCAN_ABORTED.\n");
+		results->done = 1;
+		results->aborted = 1;
+	} else if (gnlh->cmd == NL80211_CMD_NEW_SCAN_RESULTS) {
+		printf("Got NL80211_CMD_NEW_SCAN_RESULTS.\n");
+		results->done = 1;
+		results->aborted = 0;
+	}
+
+	return NL_SKIP;
+}
+
+int do_scan_trigger(struct nl_sock *socket, int if_index, int driver_id, char *ssidname)
+{
+	struct trigger_results results = { .done = 0, .aborted = 0 };
+	struct nl_msg *msg = NULL;
+	struct nl_cb *cb = NULL;
+	struct nl_msg *ssids_to_scan = NULL;
+	int err;
+	int ret;
+	int mcid = genl_ctrl_resolve_grp(socket, "nl80211", "scan");
+	nl_socket_add_membership(socket, mcid);
+
+	msg = nlmsg_alloc();
+	if (!msg) {
+		printf("ERROR: Failed to allocate netlink messagef or msg.\n");
+		err = -ENOMEM;
+		goto exit;
+	}
+
+	ssids_to_scan = nlmsg_alloc();
+	if (!ssids_to_scan) {
+		printf("ERROR: Failed to allocate netlink message for ssids_to_scan.\n");
+		err = -ENOMEM;
+		goto exit;
+	}
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb) {
+		printf("ERROR: Failed to allocate netlink callbacks.\n");
+		err = -ENOMEM;
+		goto exit;
+	}
+
+	printf("%s: ssid:%s\n", __func__, ssidname);
+
+	genlmsg_put(msg, 0, 0, driver_id, 0, 0, NL80211_CMD_TRIGGER_SCAN, 0);
+	nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
+	nla_put(ssids_to_scan, 1, strlen(ssidname), ssidname);
+	nla_put_nested(msg, NL80211_ATTR_SCAN_SSIDS, ssids_to_scan);
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, callback_trigger, &results);
+	nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
+	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
+	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
+	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
+
+	err = 1;
+	ret = nl_send_auto(socket, msg);
+	while (err > 0)
+		ret = nl_recvmsgs(socket, cb);
+	if (err < 0) {
+		printf("WARNING: err has a value of %d.\n", ret);
+		goto exit;
+	}
+	if (ret < 0) {
+		printf("ERROR: nl_recvmsgs() return %d (%s). \n", ret, nl_geterror(-ret));
+		return ret;
+	}
+
+	while (!results.done) nl_recvmsgs(socket, cb);
+	if (results.aborted) {
+		printf("ERROR: kernel aborted scan. \n");
+		return 1;
+	}
+
+	err = 0;
+	
+	if (cb) nl_cb_put(cb);
+	nl_socket_drop_membership(socket, mcid);
+exit:
+	if (msg) nlmsg_free(msg);
+	if (ssids_to_scan) nlmsg_free(ssids_to_scan);
+	return err;	
+}
+
+static void set_filter_bssid(unsigned char *arg)
+{
+	int i, l;
+	char mac_addr[20];
+
+	l = 0;
+	for (i = 0; i < 6; i++) {
+		sprintf(mac_addr + i*2, "%02X", arg[i]);
+	}
+
+	filterlist_len = 1;
+	filterlist = calloc((FILTERLIST_MAX), MACLIST_SIZE);
+	hex2bin(mac_addr, filterlist->addr, 6);
+	filtermode = 2;
+}
+
+static void get_ssid(unsigned char *ie, int ielen, char *ssid)
+{
+	uint8_t len;
+	uint8_t *data;
+	int i;
+
+	ssid[0] = '\0';
+	while (ielen >= 2 && ielen >= ie[1]) {
+		if (ie[0] == 0 && ie[1] >= 0 && ie[1] <= 32) {
+			len = ie[1];
+			data = ie + 2;
+			if (len <= 32) {
+				memcpy(ssid, data, len);
+				ssid[len] = '\0';
+			}
+			break;
+		}
+		ielen -= ie[1] + 2;
+		ie += ie[1] + 2;
+	}
+}
+
+static int freq_to_channel(uint32_t freq)
+{
+	if ((freq >= 2407) && (freq <= 2474))
+		return (freq - 2407)/5;
+	else if ((freq >= 2481) && (freq <= 2487))
+		return (freq - 2412)/5;
+	else if ((freq >= 5150) && (freq <= 5875))
+		return (freq - 5000)/5;
+	else
+		return 0;
+}
+
+static int callback_dump(struct nl_msg *msg, void *arg)
+{
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	char ssid[32+1];
+	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+	struct nlattr *bss[NL80211_BSS_MAX + 1];
+	static struct nla_policy bss_policy[NL80211_BSS_MAX + 1] = {
+		[NL80211_BSS_FREQUENCY] = { .type = NLA_U32 },
+		[NL80211_BSS_BSSID] = { },
+		[NL80211_BSS_INFORMATION_ELEMENTS] = { },
+	};
+/*
+	static struct nla_policy bss_policy[NL80211_BSS_MAX + 1] = {
+		[NL80211_BSS_TSF] = { .type = NLA_U64 },
+		[NL80211_BSS_FREQUENCY] = { .type = NLA_U32 },
+		[NL80211_BSS_BSSID] = { },
+		[NL80211_BSS_BEACON_INTERVAL] = { .type = NLA_U16 },
+		[NL80211_BSS_CAPABILITY] = { .type = NLA_U16 },
+		[NL80211_BSS_INFORMATION_ELEMENTS] = { },
+		[NL80211_BSS_SIGNAL_MBM] = { .type = NLA_U32 },
+		[NL80211_BSS_SIGNAL_UNSPEC] = { .type = NLA_U8 },
+		[NL80211_BSS_STATUS] = { .type = NLA_U32 },
+		[NL80211_BSS_SEEN_MS_AGO] = { .type = NLA_U32 },
+		[NL80211_BSS_BEACON_IES] = { },
+	};
+*/
+
+	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+	if (!tb[NL80211_ATTR_BSS]) {
+		printf("bss info missing!\n");
+		return NL_SKIP;
+	}
+	if (nla_parse_nested(bss, NL80211_BSS_MAX, tb[NL80211_ATTR_BSS], bss_policy)) {
+		printf("failed to parse nested attributes!\n");
+		return NL_SKIP;
+	}
+	if (!bss[NL80211_BSS_BSSID]) return NL_SKIP;
+	if (!bss[NL80211_BSS_INFORMATION_ELEMENTS]) return NL_SKIP;
+
+	get_ssid(nla_data(bss[NL80211_BSS_INFORMATION_ELEMENTS]), nla_len(bss[NL80211_BSS_INFORMATION_ELEMENTS]), ssid);
+	if ( strcmp(ssid, filterssid) == 0 ) {
+		set_filter_bssid(nla_data(bss[NL80211_BSS_BSSID]));
+		filterchannel = freq_to_channel(nla_get_u32(bss[NL80211_BSS_FREQUENCY]));
+		printf("%s - ch%d\n", ssid, filterchannel);
+	}
+
+	return NL_SKIP;
+}
+
+
+/*===========================================================================*/
 int main(int argc, char *argv[])
 {
 	static int auswahl;
 	static int index;
-	static bool showinterfaces = false;
-	static bool showchannels = false;
 	static struct ifreq ifr;
+	/* NeoJou */
+	int if_index;
+	struct nl_sock *socket;
+	int driver_id;
+	int err = EXIT_SUCCESS;
 
 	maxerrorcount = ERRORMAX;
 	staytime = TIME_INTERVAL;
@@ -4970,10 +5024,6 @@ int main(int argc, char *argv[])
 
 		case 'i':
 			interfacename = optarg;
-			if (interfacename == NULL) {
-				fprintf(stderr, "no interface specified\n");
-				exit(EXIT_FAILURE);
-			}
 			break;
 
 		case '?':
@@ -4987,26 +5037,19 @@ int main(int argc, char *argv[])
 		return EXIT_SUCCESS;
 	}
 
-	/* NeoJou : pre-setting */
-	pcapngoutname = strdup("wifidog.pcap");
-	processuserscanlist("11");
-	statusout = STATUS_EAPOL;
-	filterlist_len = 1;
-	filterlist = calloc((FILTERLIST_MAX), MACLIST_SIZE);
-	hex2bin("4CEDFBB09F88", filterlist->addr, 6);
-	filtermode = 2;
-
-
-	if (showinterfaces == true) {
-		show_wlaninterfaces();
-		checkallunwanted();
-		return EXIT_SUCCESS;
-	}
-
 	if (interfacename == NULL) {
 		fprintf(stderr, "no interface selected\n");
 		exit(EXIT_FAILURE);
 	}
+
+	/* NeoJou : pre-setting */
+	pcapngoutname = strdup("wifidog.pcap");
+	statusout = STATUS_EAPOL;
+
+	if_index = if_nametoindex(interfacename);
+	socket = nl_socket_alloc();
+	genl_connect(socket);
+	driver_id = genl_ctrl_resolve(socket, "nl80211");
 
 	if (getuid() != 0) {
 		fprintf(stderr, "this program requires root privileges\n");
@@ -5022,6 +5065,32 @@ int main(int argc, char *argv[])
 	if (ignorewarningflag == true) {
 		printf
 		    ("warnings are ignored - interface may not work as expected - do not report issues!\n");
+	}
+
+	filterchannel = 0;
+	err = do_scan_trigger(socket, if_index, driver_id, filterssid);
+	if (err != 0) {
+		printf("do_scan_trigger() failed with %d. \n", err);
+		goto exit;
+	}
+
+	struct nl_msg *msg = nlmsg_alloc();
+	genlmsg_put(msg, 0, 0, driver_id, 0, NLM_F_DUMP, NL80211_CMD_GET_SCAN, 0);
+	nla_put_u32(msg, NL80211_ATTR_IFINDEX, if_index);
+	nl_socket_modify_cb(socket, NL_CB_VALID, NL_CB_CUSTOM, callback_dump, NULL);
+
+	int ret = nl_send_auto(socket, msg);
+	ret = nl_recvmsgs_default(socket);
+	nlmsg_free(msg);
+	if (ret < 0) {
+		printf("ERROR: nl_recvmsgs_default() return %d (%s).\n", 
+		       ret, nl_geterror(-ret));
+		return ret;
+	}
+
+	if (filterchannel == 0) {
+		printf("ERROR: cannot find AP\n");
+		return 0;
 	}
 
 	printf("initialization...\n");
@@ -5059,28 +5128,18 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	if (showchannels == true) {
-		show_channels();
-		goto exit;
-	}
-
-	test_channels();
-
-	if (channelscanlist[0] == 0) {
-		fprintf(stderr, "no available channel found in scan list\n");
-		goto exit;
-	}
+	test_channels(filterchannel);
 
 	if (rcascanflag == false) {
-		processpackets();
+		processpackets(filterchannel);
 	} else {
-		processrcascan();
+		processrcascan(filterchannel);
 	}
 
 exit:
 	globalclose();
 
-	return EXIT_SUCCESS;
+	return err; 
 }
 
 /*===========================================================================*/
